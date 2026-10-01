@@ -3,7 +3,7 @@ set -eu
 umask 077
 cd /opt/gophish
 
-export DB_PATH="${DB_PATH:-${DB_FILE_PATH:-/data/gophish.db}}"
+export DB_NAME="${DB_NAME:-sqlite3}"
 export ADMIN_LISTEN_URL="${ADMIN_LISTEN_URL:-127.0.0.1:3333}"
 export ADMIN_USE_TLS="${ADMIN_USE_TLS:-true}"
 export ADMIN_CERT_PATH="${ADMIN_CERT_PATH:-/data/gophish_admin.crt}"
@@ -12,12 +12,25 @@ export PHISH_LISTEN_URL="${PHISH_LISTEN_URL:-0.0.0.0:${PORT:-8080}}"
 
 fail() { echo "Configuration error: $*" >&2; exit 1; }
 
-case "$DB_PATH" in
-    /*) ;;
-    *) fail 'DB_PATH must be an absolute SQLite filename (not a DSN)' ;;
+case "$DB_NAME" in
+    sqlite3)
+        export DB_PATH="${DB_PATH:-${DB_FILE_PATH:-/data/gophish.db}}"
+        case "$DB_PATH" in
+            /*) ;;
+            *) fail 'DB_PATH must be an absolute SQLite filename (not a DSN)' ;;
+        esac
+        [ "$(dirname "$DB_PATH")" != / ] || fail 'DB_PATH must be inside a data directory'
+        db_connection=$DB_PATH
+        ;;
+    mysql)
+        [ -n "${DB_DSN:-}" ] || fail 'DB_NAME=mysql requires DB_DSN in Go MySQL driver format'
+        case "$DB_DSN" in
+            mysql://*) fail 'DB_DSN must use Go MySQL driver format, not a mysql:// URL' ;;
+        esac
+        db_connection=$DB_DSN
+        ;;
+    *) fail 'DB_NAME must be sqlite3 or mysql' ;;
 esac
-[ "$(dirname "$DB_PATH")" != / ] || fail 'DB_PATH must be inside a data directory'
-[ "${DB_NAME:-sqlite3}" = sqlite3 ] || fail 'This image supports SQLite only'
 [ "${PHISH_USE_TLS:-false}" = false ] || fail 'Public TLS must terminate at the reverse proxy'
 case "$ADMIN_USE_TLS" in true|false) ;; *) fail 'ADMIN_USE_TLS must be true or false' ;; esac
 
@@ -34,11 +47,13 @@ esac
 if [ "$(id -u)" = 0 ]; then
     # Only touch the configured data directories and known application files;
     # never recursively change ownership of a user's mounted volume.
-    mkdir -p "$(dirname "$DB_PATH")"
-    chown app:app "$(dirname "$DB_PATH")"
-    for file in "$DB_PATH" "$DB_PATH-journal" "$DB_PATH-wal" "$DB_PATH-shm"; do
-        if [ -f "$file" ]; then chown app:app "$file"; chmod 600 "$file"; fi
-    done
+    if [ "$DB_NAME" = sqlite3 ]; then
+        mkdir -p "$(dirname "$DB_PATH")"
+        chown app:app "$(dirname "$DB_PATH")"
+        for file in "$DB_PATH" "$DB_PATH-journal" "$DB_PATH-wal" "$DB_PATH-shm"; do
+            if [ -f "$file" ]; then chown app:app "$file"; chmod 600 "$file"; fi
+        done
+    fi
     if [ "$ADMIN_USE_TLS" = true ]; then
         for file in "$ADMIN_CERT_PATH" "$ADMIN_KEY_PATH"; do
             [ "$(dirname "$file")" != / ] || fail 'Admin certificates must be inside a dedicated directory'
@@ -50,8 +65,10 @@ if [ "$(id -u)" = 0 ]; then
     exec gosu app:app /usr/local/bin/gophish-entrypoint "$@"
 fi
 
-mkdir -p "$(dirname "$DB_PATH")"
-[ -w "$(dirname "$DB_PATH")" ] || fail 'SQLite directory is not writable by UID 10001'
+if [ "$DB_NAME" = sqlite3 ]; then
+    mkdir -p "$(dirname "$DB_PATH")"
+    [ -w "$(dirname "$DB_PATH")" ] || fail 'SQLite directory is not writable by UID 10001'
+fi
 if [ "$ADMIN_USE_TLS" = true ]; then
     mkdir -p "$(dirname "$ADMIN_CERT_PATH")" "$(dirname "$ADMIN_KEY_PATH")"
 fi
@@ -63,7 +80,8 @@ jq \
     --arg admin "$ADMIN_LISTEN_URL" \
     --argjson admin_tls "$ADMIN_USE_TLS" \
     --arg cert "$ADMIN_CERT_PATH" --arg key "$ADMIN_KEY_PATH" \
-    --arg phish "$PHISH_LISTEN_URL" --arg db "$DB_PATH" \
+    --arg phish "$PHISH_LISTEN_URL" --arg db "$db_connection" \
+    --arg db_name "$DB_NAME" --arg db_ca "${DB_SSL_CA_PATH:-}" \
     --arg contact "${CONTACT_ADDRESS:-}" \
     --arg origins "${ADMIN_TRUSTED_ORIGINS:-}" \
     --arg level "${LOG_LEVEL:-info}" \
@@ -72,7 +90,7 @@ jq \
      .admin_server.cert_path = $cert | .admin_server.key_path = $key |
      (if $origins != "" then .admin_server.trusted_origins = ($origins | split(",")) else . end) |
      .phish_server.listen_url = $phish | .phish_server.use_tls = false |
-     .db_name = "sqlite3" | .db_path = $db |
+     .db_name = $db_name | .db_path = $db | .db_sslca_path = $db_ca |
      .migrations_prefix = "/opt/gophish/db/db_" |
      .contact_address = $contact | .logging = {filename: "", level: $level}' \
     config.json > "$runtime_config"

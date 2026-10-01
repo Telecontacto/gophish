@@ -18,6 +18,7 @@ WORKDIR /opt/gophish
 COPY --from=builder /out/gophish ./gophish
 COPY VERSION LICENSE config.json ./
 COPY db/db_sqlite3/ ./db/db_sqlite3/
+COPY db/db_mysql/ ./db/db_mysql/
 COPY templates/ ./templates/
 COPY static/js/dist/ ./static/js/dist/
 COPY static/js/src/vendor/ckeditor/ ./static/js/src/vendor/ckeditor/

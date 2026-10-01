@@ -15,7 +15,7 @@
   database, limits connections to one, applies Goose SQL migrations and seeds the
   initial admin. SQLite currently defaults to `gophish.db` in the working directory.
   Goose uses `db/db_sqlite3` (discovers its `migrations/` directory); MySQL has a
-  separate migration tree, not included in the SQLite runtime image.
+  separate migration tree. Both are now included in the runtime image.
 - `worker/`, `mailer/`, `imap/`: background sending and mailbox reporting, started
   with admin mode. Mail locks are unlocked at process startup. The mail worker has
   no shutdown/drain method; IMAP cancellation does not wait for network work.
@@ -57,6 +57,7 @@ Under the fixed working directory `/opt/gophish`:
 | `config.json` | Base settings for the entrypoint; original file unchanged. |
 | `db/db_sqlite3/migrations/*.sql` | All existing SQL migrations, automatically applied at startup. |
 | `db/db_sqlite3/dbconf.yml` | Included with the existing migration tree for compatibility; runtime uses the Go-built DB configuration. |
+| `db/db_mysql/**` | Existing MySQL SQL migrations and configuration, used only when `DB_NAME=mysql`. |
 | `templates/*.html` | All admin views, shared base/navigation/flashes and login/reset views. |
 | `static/js/dist/**` | Existing application and vendor bundles. |
 | `static/js/src/vendor/ckeditor/**` | Editor code, adapters, plugins, styles, skins, language and image assets loaded dynamically. |
@@ -116,6 +117,32 @@ files written at runtime outside a volume will not survive replacement.
   ephemeral; upgrades may log users out. No dependency security audit performed.
 
 ## Verification
+
+### MySQL follow-up (fresh installation)
+
+At the operator's request, Docker now accepts `DB_NAME=mysql` plus a secret
+`DB_DSN` in the existing Go driver's format. SQLite remains the default. Both
+migration trees are copied into the image; MySQL mode skips SQLite directory/file
+initialization entirely. Optional `DB_SSL_CA_PATH` maps to the existing config
+field (custom CA requires `tls=ssl_ca` in the DSN). No database driver, SQL
+migration, model, auth or dependency was changed. No remote service was created,
+no SQLite data was removed/imported and no credentials were added to Git.
+
+Follow-up checks: `bash docker/run_test.sh` passed with real jq and an executable
+stub: SQLite default, MySQL JSON, ignored SQLite path, custom CA mapping, no DSN
+logging, missing DSN/URL/unsupported-backend rejection and admin security guards.
+`TestLoadMySQLConfig` also passed: the documented DSN parses using the existing
+MySQL driver with datetime/UTC options, and `LoadConfig` discovers the MySQL
+migration tree without opening a connection. SQLite config and public health/
+admin-isolation regression tests passed separately. The optimized Linux/amd64
+CGO build passed again. The full Go suite was rerun;
+the same three network-dependent packages failed on Windows socket permissions.
+Docker build was attempted again but Docker is still unavailable. **Live MySQL
+connectivity, MySQL SQL migrations and authentication/version compatibility are
+not verified in this environment.** Follow the fresh-install staging checks in
+the README before production; retain the app's volume for admin certificates.
+
+### Initial SQLite deployment verification
 
 Environment: Windows, no installed Docker or WSL Linux distribution. Go 1.26.8
 and Zig 0.13.0 were downloaded into the approved temporary directory (archives

@@ -29,7 +29,7 @@ default. It uses the committed frontend bundles, without rebuilding or changing
 the UI. See [the deployment analysis](doc/railway.md) for runtime requirements,
 security tradeoffs and verification results. Use only for authorized engagements.
 
-#### Service and persistent storage
+#### Service and persistent storage (SQLite default)
 
 1. Create a Railway project/service from your fork's GitHub repository. Set its
    root directory to the directory containing `go.mod`, `Dockerfile` and
@@ -53,8 +53,8 @@ The entrypoint starts briefly as root to prepare mounted-directory ownership,
 then runs GoPhish as UID/GID **10001**. SQLite, its journal files and admin
 certificates remain on the volume. If running the image with `--user 10001:10001`,
 pre-create writable data/certificate directories with that ownership yourself.
-`DB_PATH` must be an absolute filename, not `:memory:` or a SQLite URI. A path
-outside the mounted volume is **not persistent**.
+In SQLite mode, `DB_PATH` must be an absolute filename, not `:memory:` or a
+SQLite URI. A path outside the mounted volume is **not persistent**.
 
 #### Environment variables (Docker entrypoint)
 
@@ -68,16 +68,68 @@ outside the mounted volume is **not persistent**.
 | `ADMIN_KEY_PATH` | `/data/gophish_admin.key`. |
 | `ALLOW_PUBLIC_ADMIN` | `false`; explicit opt-in required for any non-loopback admin bind, including private networking. TLS remains required. |
 | `ADMIN_TRUSTED_ORIGINS` | Optional comma-separated admin origins in the existing GoPhish format (`host[:port]`, without scheme). No wildcard. |
-| `DB_PATH` | `/data/gophish.db`; legacy `DB_FILE_PATH` is accepted as a fallback. |
+| `DB_NAME` | `sqlite3`; also accepts `mysql`. Selects the existing migration tree. |
+| `DB_PATH` | SQLite only: `/data/gophish.db`; legacy `DB_FILE_PATH` is accepted as a fallback. Ignored in MySQL mode. |
+| `DB_DSN` | Required for MySQL: Go driver DSN, not a `mysql://` URL. Store as a secret. |
+| `DB_SSL_CA_PATH` | Optional MySQL CA certificate path; use `tls=ssl_ca` in the DSN to enable existing custom-CA support. |
 | `CONTACT_ADDRESS` | Empty; set to your team's contact email. |
 | `LOG_LEVEL` | `info`; existing Logrus levels. |
 | `GOPHISH_INITIAL_ADMIN_PASSWORD` | Existing optional bootstrap secret, only while password change is required. Set through Railway secrets, never Git. |
 | `GOPHISH_INITIAL_ADMIN_API_TOKEN` | Existing optional initial-user API token secret. |
 
-This image intentionally supports SQLite and public HTTP only (`DB_NAME`, if
-set, must be `sqlite3`; `PHISH_USE_TLS`, if set, must be `false`). Native binary
+This image supports SQLite or MySQL, with public HTTP only (`PHISH_USE_TLS`, if
+set, must be `false`). Native binary
 configuration via `--config` is unchanged. Generated configuration is private,
 ephemeral and never printed; it does not need to live on the volume.
+
+#### MySQL on Railway (fresh database, no data import)
+
+1. Add a MySQL service in the **same Railway project/environment** as GoPhish.
+   Use a dedicated empty database. Keep MySQL's persistent volume attached to the
+   database service and use its **private** hostname/port, not a public TCP proxy.
+2. On the GoPhish service, set `DB_NAME=mysql` and create a secret `DB_DSN` in
+   **Go MySQL driver format**. For a database service named `MySQL`, Railway
+   variable references can be composed as follows (adjust the service name):
+
+   ```text
+   ${{MySQL.MYSQLUSER}}:${{MySQL.MYSQLPASSWORD}}@tcp(${{MySQL.MYSQLHOST}}:${{MySQL.MYSQLPORT}})/${{MySQL.MYSQLDATABASE}}?charset=utf8mb4&parseTime=true&loc=UTC
+   ```
+
+   Confirm `MYSQLHOST` resolves to the private service address and `MYSQLPORT`
+   is the internal MySQL port. Do **not** paste `MYSQL_URL` directly: its
+   `mysql://...` URL format is not the DSN expected by this Go driver. The database
+   must already exist; GoPhish creates tables/migrations, not the database itself.
+   `parseTime=true` is needed for MySQL datetime fields; use UTC consistently.
+3. Remove/unset obsolete database connection overrides if desired; `DB_PATH` and
+   `DB_FILE_PATH` are ignored in MySQL mode. **Do not delete the existing GoPhish
+   `/data` volume:** it still persists the admin certificate/key. SQLite files
+   are left untouched and are neither imported into MySQL nor deleted.
+4. Deploy GoPhish. The existing `db/db_mysql` migrations initialize the empty
+   database and create a **new** admin user with a new temporary password in logs.
+   Log in, change the password, and verify a harmless group persists on redeploy.
+   Public/admin routing and TLS remain exactly as before.
+
+Use a dedicated database user scoped to the GoPhish database rather than a
+shared/root account for production. It needs runtime read/write privileges and
+DDL privileges to apply the existing migrations (`CREATE`, `ALTER`, `DROP`,
+`INDEX`); do not grant global administrative privileges. Keep credentials only
+in Railway secrets/reference variables, never Git or screenshots.
+
+Private networking is not the same as database TLS authentication. If the MySQL
+server provides TLS, use `tls=true` with a publicly trusted CA, or `tls=ssl_ca`
+with `DB_SSL_CA_PATH` pointing to a securely provisioned CA file. The private
+connection example above does not enable database TLS. Do not use
+`tls=skip-verify`, disable server validation, or weaken MySQL authentication to
+work around connection errors. The legacy driver/migrations still require a live
+compatibility test against your chosen MySQL version; do not assume every future
+MySQL version is compatible.
+
+To verify entrypoint configuration without running a database, install Bash/jq
+on a Linux runner and execute `bash docker/run_test.sh`. This test does not verify
+live MySQL connectivity or SQL migration compatibility. Once the deployment is
+healthy, test admin login, password change, harmless group/template persistence,
+and startup on redeploy. `/health` becomes available only after DB setup, but it
+is not a continuous database connectivity check.
 
 #### Administrative access: safe default and explicit alternatives
 
@@ -114,16 +166,21 @@ Do not disable certificate validation globally. Missing *both* certificate files
 triggers generation; a partially provisioned pair must be repaired by an operator.
 Authentication, password reset, CSRF and secure cookies remain intact.
 
-**Two services are not implemented.** The existing `--mode admin` / `--mode phish`
-flags could support that architecture, but two services cannot simply share a
+**Splitting into two application services is not implemented.** The existing
+`--mode admin` / `--mode phish` flags could support that architecture, but two
+services cannot simply share a
 Railway SQLite Volume. It requires a different database/storage architecture and
 coordination of migrations and the mail worker; defer this to a later phase.
+Using a separate MySQL database service does not split the GoPhish application.
 
 #### Updates, backups and limitations
 
-Push changes to the connected branch or redeploy the service; keep the same
-volume. Back up SQLite consistently before updates (SQLite backup API, or stop
-the process and copy the database), protect the backups and test restoration.
+Push changes to the connected branch or redeploy the service; keep persistent
+volumes. For MySQL, configure database backups on its service and test restoration;
+keep one GoPhish replica because the original mail worker/startup locks are not
+designed for coordinated replicas. Back up SQLite consistently before updates
+(SQLite backup API, or stop the process and copy the database), protect the
+backups and test restoration.
 Never copy only an actively written database while ignoring journals. Use one
 replica; do not run two processes against the database during rollout. Expect
 brief downtime with volume-backed deployments; disable sleeping/serverless mode
