@@ -31,6 +31,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 
 	"gopkg.in/alecthomas/kingpin.v2"
 
@@ -118,12 +119,12 @@ func main() {
 	middleware.Store.Options.Secure = adminConfig.UseTLS
 
 	phishConfig := conf.PhishConf
-	phishServer := controllers.NewPhishingServer(phishConfig)
+	phishServer := controllers.NewPhishingServer(phishConfig, controllers.WithContactAddress(conf.ContactAddress))
 
 	imapMonitor := imap.NewMonitor()
 	if *mode == "admin" || *mode == "all" {
 		go adminServer.Start()
-		go imapMonitor.Start()
+		imapMonitor.Start()
 	}
 	if *mode == "phish" || *mode == "all" {
 		go phishServer.Start()
@@ -131,15 +132,20 @@ func main() {
 
 	// Handle graceful shutdown
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	<-c
-	log.Info("CTRL+C Received... Gracefully shutting down servers")
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	sig := <-c
+	signal.Stop(c)
+	log.Infof("Received %s; gracefully shutting down servers", sig)
 	if *mode == modeAdmin || *mode == modeAll {
-		adminServer.Shutdown()
+		if err := adminServer.Shutdown(); err != nil {
+			log.Error(err)
+		}
 		imapMonitor.Shutdown()
 	}
 	if *mode == modePhish || *mode == modeAll {
-		phishServer.Shutdown()
+		if err := phishServer.Shutdown(); err != nil {
+			log.Error(err)
+		}
 	}
 
 }

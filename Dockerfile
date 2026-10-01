@@ -1,45 +1,36 @@
-# Minify client side assets (JavaScript)
-FROM node:latest AS build-js
+FROM golang:1.26.8-bookworm AS builder
 
-RUN npm install gulp gulp-cli -g
-
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
+COPY go.mod go.sum ./
+RUN go mod download
 COPY . .
-RUN npm install --only=dev
-RUN gulp
+RUN CGO_ENABLED=1 GOOS=linux go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/gophish .
 
-
-# Build Golang binary
-FROM golang:1.15.2 AS build-golang
-
-WORKDIR /go/src/github.com/gophish/gophish
-COPY . .
-RUN go get -v && go build -v
-
-
-# Runtime container
-FROM debian:stable-slim
-
-RUN useradd -m -d /opt/gophish -s /bin/bash app
-
-RUN apt-get update && \
-	apt-get install --no-install-recommends -y jq libcap2-bin ca-certificates && \
-	apt-get clean && \
-	rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+FROM debian:bookworm-slim
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates jq gosu tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
 
 WORKDIR /opt/gophish
-COPY --from=build-golang /go/src/github.com/gophish/gophish/ ./
-COPY --from=build-js /build/static/js/dist/ ./static/js/dist/
-COPY --from=build-js /build/static/css/dist/ ./static/css/dist/
-COPY --from=build-golang /go/src/github.com/gophish/gophish/config.json ./
-RUN chown app. config.json
+COPY --from=builder /out/gophish ./gophish
+COPY VERSION LICENSE config.json ./
+COPY db/db_sqlite3/ ./db/db_sqlite3/
+COPY templates/ ./templates/
+COPY static/js/dist/ ./static/js/dist/
+COPY static/js/src/vendor/ckeditor/ ./static/js/src/vendor/ckeditor/
+COPY static/css/dist/ ./static/css/dist/
+COPY static/images/ ./static/images/
+COPY static/font/ ./static/font/
+COPY static/db/ ./static/db/
+COPY static/endpoint/ ./static/endpoint/
+COPY docker/run.sh /usr/local/bin/gophish-entrypoint
+RUN sed -i 's/\r$//' /usr/local/bin/gophish-entrypoint \
+    && chmod 755 /usr/local/bin/gophish-entrypoint
 
-RUN setcap 'cap_net_bind_service=+ep' /opt/gophish/gophish
-
-USER app
-RUN sed -i 's/127.0.0.1/0.0.0.0/g' config.json
-RUN touch config.json.tmp
-
-EXPOSE 3333 8080 8443 80
-
-CMD ["./docker/run.sh"]
+# The entrypoint briefly runs as root to initialize mounted-volume permissions,
+# then execs the application as UID/GID 10001 (no privileged ports required).
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/gophish-entrypoint"]

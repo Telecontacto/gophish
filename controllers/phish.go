@@ -83,19 +83,24 @@ func WithContactAddress(addr string) PhishingServerOption {
 
 // Start launches the phishing server, listening on the configured address.
 func (ps *PhishingServer) Start() {
+	var err error
 	if ps.config.UseTLS {
 		// Only support TLS 1.2 and above - ref #1691, #1689
 		ps.server.TLSConfig = defaultTLSConfig
-		err := util.CheckAndCreateSSL(ps.config.CertPath, ps.config.KeyPath)
+		err = util.CheckAndCreateSSL(ps.config.CertPath, ps.config.KeyPath)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Infof("Starting phishing server at https://%s", ps.config.ListenURL)
-		log.Fatal(ps.server.ListenAndServeTLS(ps.config.CertPath, ps.config.KeyPath))
+		err = ps.server.ListenAndServeTLS(ps.config.CertPath, ps.config.KeyPath)
+	} else {
+		// If TLS isn't configured, just listen on HTTP
+		log.Infof("Starting phishing server at http://%s", ps.config.ListenURL)
+		err = ps.server.ListenAndServe()
 	}
-	// If TLS isn't configured, just listen on HTTP
-	log.Infof("Starting phishing server at http://%s", ps.config.ListenURL)
-	log.Fatal(ps.server.ListenAndServe())
+	if err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 // Shutdown attempts to gracefully shutdown the server.
@@ -108,6 +113,11 @@ func (ps *PhishingServer) Shutdown() error {
 // CreatePhishingRouter creates the router that handles phishing connections.
 func (ps *PhishingServer) registerRoutes() {
 	router := mux.NewRouter()
+	// Register before the campaign catch-all; do not record health probes as events.
+	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok"}`))
+	}).Methods(http.MethodGet)
 	fileServer := http.FileServer(unindexed.Dir("./static/endpoint/"))
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", fileServer))
 	router.HandleFunc("/track", ps.TrackHandler)

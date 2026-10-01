@@ -93,22 +93,27 @@ func NewAdminServer(config config.AdminServer, options ...AdminServerOption) *Ad
 
 // Start launches the admin server, listening on the configured address.
 func (as *AdminServer) Start() {
+	var err error
 	if as.worker != nil {
 		go as.worker.Start()
 	}
 	if as.config.UseTLS {
 		// Only support TLS 1.2 and above - ref #1691, #1689
 		as.server.TLSConfig = defaultTLSConfig
-		err := util.CheckAndCreateSSL(as.config.CertPath, as.config.KeyPath)
+		err = util.CheckAndCreateSSL(as.config.CertPath, as.config.KeyPath)
 		if err != nil {
 			log.Fatal(err)
 		}
 		log.Infof("Starting admin server at https://%s", as.config.ListenURL)
-		log.Fatal(as.server.ListenAndServeTLS(as.config.CertPath, as.config.KeyPath))
+		err = as.server.ListenAndServeTLS(as.config.CertPath, as.config.KeyPath)
+	} else {
+		// If TLS isn't configured, just listen on HTTP
+		log.Infof("Starting admin server at http://%s", as.config.ListenURL)
+		err = as.server.ListenAndServe()
 	}
-	// If TLS isn't configured, just listen on HTTP
-	log.Infof("Starting admin server at http://%s", as.config.ListenURL)
-	log.Fatal(as.server.ListenAndServe())
+	if err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 // Shutdown attempts to gracefully shutdown the server.
