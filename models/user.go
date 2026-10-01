@@ -5,6 +5,7 @@ import (
 	"time"
 
 	log "github.com/gophish/gophish/logger"
+	"github.com/jinzhu/gorm"
 )
 
 // ErrModifyingOnlyAdmin occurs when there is an attempt to modify the only
@@ -23,6 +24,16 @@ type User struct {
 	PasswordChangeRequired bool      `json:"password_change_required"`
 	AccountLocked          bool      `json:"account_locked"`
 	LastLogin              time.Time `json:"last_login"`
+}
+
+// BeforeSave leaves a never-logged-in user's nullable MySQL column unset.
+// Omitting it on both insert and update avoids zero dates during bootstrap and
+// password changes, while retaining the original time.Time/API representation.
+func (u *User) BeforeSave(scope *gorm.Scope) error {
+	if scope.Dialect().GetName() == "mysql" && u.LastLogin.IsZero() {
+		scope.Search.Omit(append(scope.OmitAttrs(), "last_login")...)
+	}
+	return nil
 }
 
 // GetUser returns the user that the given id corresponds to. If no user is found, an

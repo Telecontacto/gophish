@@ -124,8 +124,8 @@ At the operator's request, Docker now accepts `DB_NAME=mysql` plus a secret
 `DB_DSN` in the existing Go driver's format. SQLite remains the default. Both
 migration trees are copied into the image; MySQL mode skips SQLite directory/file
 initialization entirely. Optional `DB_SSL_CA_PATH` maps to the existing config
-field (custom CA requires `tls=ssl_ca` in the DSN). No database driver, SQL
-migration, model, auth or dependency was changed. No remote service was created,
+field (custom CA requires `tls=ssl_ca` in the DSN). Initial backend enablement
+changed no database driver, SQL migration, model, auth or dependency. No remote service was created,
 no SQLite data was removed/imported and no credentials were added to Git.
 
 Follow-up checks: `bash docker/run_test.sh` passed with real jq and an executable
@@ -141,6 +141,31 @@ Docker build was attempted again but Docker is still unavailable. **Live MySQL
 connectivity, MySQL SQL migrations and authentication/version compatibility are
 not verified in this environment.** Follow the fresh-install staging checks in
 the README before production; retain the app's volume for admin certificates.
+
+### MySQL strict-mode startup correction
+
+A live deployment reported Error 1292 while creating the bootstrap admin:
+the legacy driver's zero `time.Time` was serialized as a MySQL zero date for
+`users.last_login`. The existing column is nullable, but GORM explicitly included
+the zero value in both the initial INSERT and the password's subsequent UPDATE.
+
+`User.BeforeSave` now omits `last_login` only for MySQL when it is unset. New
+users receive the column's existing SQL NULL default, and pre-login password/
+account updates leave that NULL untouched. Real login timestamps still save
+normally. SQLite behavior and the original JSON zero-time representation remain
+unchanged. There is no schema migration, database reset, fake login timestamp,
+SQL mode override or authentication change. An existing partially initialized
+database can retry normal startup after deployment; it need not be deleted.
+
+`TestMySQLUserUnsetLastLogin` exercises real GORM MySQL INSERT/UPDATE generation
+over a local SQLite connection with a CHECK rejecting invalid dates. It verifies
+SQL NULL on creation and password update, NULL reload, preservation of other
+fields/omissions, real login timestamp persistence and unchanged SQLite scope
+behavior. This is a regression test of SQL generation, not a live MySQL server
+test; deployment against strict-mode MySQL remains the final integration check.
+The regression test and full `models`/`config` tests passed, as did the optimized
+Linux/amd64 CGO build. The full Go suite was rerun with the same Windows socket
+permission failures in controllers, API and webhook; other packages passed.
 
 ### Initial SQLite deployment verification
 
