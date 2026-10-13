@@ -33,6 +33,23 @@ type Campaign struct {
 	URL           string    `json:"url"`
 }
 
+// BeforeSave evita guardar fechas vacías en MySQL.
+func (c *Campaign) BeforeSave(scope *gorm.Scope) error {
+	if scope.Dialect().GetName() != "mysql" {
+		return nil
+	}
+
+	omitted := append([]string{}, scope.OmitAttrs()...)
+	if c.SendByDate.IsZero() {
+		omitted = append(omitted, "send_by_date")
+	}
+	if c.CompletedDate.IsZero() {
+		omitted = append(omitted, "completed_date")
+	}
+	scope.Search.Omit(omitted...)
+	return nil
+}
+
 // CampaignResults is a struct representing the results from a campaign
 type CampaignResults struct {
 	Id      int64    `json:"id"`
