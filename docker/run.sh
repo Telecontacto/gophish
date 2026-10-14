@@ -6,6 +6,15 @@ cd /opt/gophish
 export DB_NAME="${DB_NAME:-sqlite3}"
 export ADMIN_LISTEN_URL="${ADMIN_LISTEN_URL:-127.0.0.1:3333}"
 export ADMIN_USE_TLS="${ADMIN_USE_TLS:-true}"
+export ADMIN_PROXY_ENABLED="${ADMIN_PROXY_ENABLED:-false}"
+supervise_proxy=$ADMIN_PROXY_ENABLED
+# Preserve informational commands and campaign-only mode as single-process runs.
+previous_arg=
+for arg in "$@"; do
+    case "$arg" in --help|-h|--version|--mode=phish) supervise_proxy=false ;; esac
+    if [ "$previous_arg" = --mode ] && [ "$arg" = phish ]; then supervise_proxy=false; fi
+    previous_arg=$arg
+done
 export ADMIN_CERT_PATH="${ADMIN_CERT_PATH:-/data/gophish_admin.crt}"
 export ADMIN_KEY_PATH="${ADMIN_KEY_PATH:-/data/gophish_admin.key}"
 export PHISH_LISTEN_URL="${PHISH_LISTEN_URL:-0.0.0.0:${PORT:-8080}}"
@@ -33,6 +42,19 @@ case "$DB_NAME" in
 esac
 [ "${PHISH_USE_TLS:-false}" = false ] || fail 'Public TLS must terminate at the reverse proxy'
 case "$ADMIN_USE_TLS" in true|false) ;; *) fail 'ADMIN_USE_TLS must be true or false' ;; esac
+case "$ADMIN_PROXY_ENABLED" in true|false) ;; *) fail 'ADMIN_PROXY_ENABLED must be true or false' ;; esac
+if [ "$ADMIN_PROXY_ENABLED" = true ]; then
+    [ "$ADMIN_LISTEN_URL" = 127.0.0.1:3333 ] || fail 'Admin proxy requires ADMIN_LISTEN_URL=127.0.0.1:3333'
+    [ "$ADMIN_USE_TLS" = false ] || fail 'Admin proxy requires ADMIN_USE_TLS=false'
+    [ "${ALLOW_PUBLIC_ADMIN:-false}" = false ] || fail 'Admin proxy requires ALLOW_PUBLIC_ADMIN=false'
+    [ -n "${ADMIN_TRUSTED_ORIGINS:-}" ] || fail 'Admin proxy requires ADMIN_TRUSTED_ORIGINS (host[:port], no scheme)'
+    case "$ADMIN_TRUSTED_ORIGINS" in *://*|*/*|*\**|*\ *|*,,*|,*|*,) fail 'Invalid admin trusted origins: use comma-separated hosts without schemes or wildcards' ;; esac
+    # Do not allow a second config to bypass proxy security invariants. Other
+    # arguments (including --mode, --disable-mailer, --help/version) pass through.
+    for arg in "$@"; do
+        case "$arg" in --config|--config=*) fail '--config override is incompatible with admin proxy mode' ;; esac
+    done
+fi
 
 # Refuse accidental exposure, even if the platform selects the wrong target port.
 case "$ADMIN_LISTEN_URL" in
@@ -79,6 +101,7 @@ runtime_config=$(mktemp /tmp/gophish-config.XXXXXX)
 jq \
     --arg admin "$ADMIN_LISTEN_URL" \
     --argjson admin_tls "$ADMIN_USE_TLS" \
+    --argjson admin_proxy "$ADMIN_PROXY_ENABLED" \
     --arg cert "$ADMIN_CERT_PATH" --arg key "$ADMIN_KEY_PATH" \
     --arg phish "$PHISH_LISTEN_URL" --arg db "$db_connection" \
     --arg db_name "$DB_NAME" --arg db_ca "${DB_SSL_CA_PATH:-}" \
@@ -87,6 +110,7 @@ jq \
     --arg level "${LOG_LEVEL:-info}" \
     '.admin_server.listen_url = $admin |
      .admin_server.use_tls = $admin_tls |
+     (if $admin_proxy then .admin_server.secure_cookies = true | .admin_server.disable_access_log = true else . end) |
      .admin_server.cert_path = $cert | .admin_server.key_path = $key |
      (if $origins != "" then .admin_server.trusted_origins = ($origins | split(",")) else . end) |
      .phish_server.listen_url = $phish | .phish_server.use_tls = false |
@@ -97,4 +121,8 @@ jq \
 
 # LoadConfig appends db_name to migrations_prefix.
 # All other runtime assets resolve from the fixed WORKDIR above.
+if [ "$supervise_proxy" = true ]; then
+    export GOPHISH_RUNTIME_CONFIG="$runtime_config"
+    exec python3 /opt/gophish/supervise.py ./gophish --config "$runtime_config" "$@"
+fi
 exec ./gophish --config "$runtime_config" "$@"

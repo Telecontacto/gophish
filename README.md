@@ -23,9 +23,11 @@ You can also use Gophish via the official Docker container [here](https://hub.do
 
 ### Deploying on Railway
 
-This fork's Dockerfile runs a **single instance** with two separate listeners:
+This fork's Dockerfile runs a **single application instance** with two separate listeners:
 public HTTP behind Railway HTTPS, and an HTTPS admin listener on loopback by
-default. It uses the committed frontend bundles, without rebuilding or changing
+default. An opt-in Nginx listener on 3334 supports the admin/API behind Railway
+HTTPS while GoPhish remains HTTP on loopback only, with Secure cookies. It uses
+the committed frontend bundles, without rebuilding or changing
 the UI. See [the deployment analysis](doc/railway.md) for runtime requirements,
 security tradeoffs and verification results. Use only for authorized engagements.
 
@@ -50,7 +52,7 @@ security tradeoffs and verification results. Use only for authorized engagements
    admin password: restrict log access and change that password immediately.
 
 The entrypoint starts briefly as root to prepare mounted-directory ownership,
-then runs GoPhish as UID/GID **10001**. SQLite, its journal files and admin
+then runs GoPhish, Nginx and the supervisor as UID/GID **10001**. SQLite, its journal files and admin
 certificates remain on the volume. If running the image with `--user 10001:10001`,
 pre-create writable data/certificate directories with that ownership yourself.
 In SQLite mode, `DB_PATH` must be an absolute filename, not `:memory:` or a
@@ -64,6 +66,7 @@ SQLite URI. A path outside the mounted volume is **not persistent**.
 | `PHISH_LISTEN_URL` | Optional explicit `host:port`; takes precedence over `PORT`. |
 | `ADMIN_LISTEN_URL` | `127.0.0.1:3333`; separate administrative listener. |
 | `ADMIN_USE_TLS` | `true`; `false` allowed only on loopback. |
+| `ADMIN_PROXY_ENABLED` | `false`; opt into Nginx HTTP on 3334 behind Railway HTTPS, requiring loopback admin HTTP and trusted hosts. Forces Secure session/CSRF cookies and disables admin request access logs. |
 | `ADMIN_CERT_PATH` | `/data/gophish_admin.crt`. |
 | `ADMIN_KEY_PATH` | `/data/gophish_admin.key`. |
 | `ALLOW_PUBLIC_ADMIN` | `false`; explicit opt-in required for any non-loopback admin bind, including private networking. TLS remains required. |
@@ -133,10 +136,103 @@ is not a continuous database connectivity check.
 
 #### Administrative access: safe default and explicit alternatives
 
-The public domain does **not** serve `/login` or `/api/`. With the default
+The **campaign** domain does **not** serve `/login` or `/api/`. With the default
 loopback bind, there is intentionally no remote browser access to the admin.
 Railway SSH provides a remote shell, not an automatically configured TCP tunnel;
 do not assume `railway connect` forwards this application.
+
+##### Administrative HTTPS domain through Railway (opt-in)
+
+For this deployment, set exactly these admin/proxy variables:
+
+```text
+ADMIN_PROXY_ENABLED=true
+ADMIN_LISTEN_URL=127.0.0.1:3333
+ADMIN_USE_TLS=false
+ALLOW_PUBLIC_ADMIN=false
+ADMIN_TRUSTED_ORIGINS=gophish-production-7157.up.railway.app
+```
+
+Keep `PORT=8080` and `PHISH_LISTEN_URL=0.0.0.0:8080` for the existing campaign
+listener. **Do not change existing DB_NAME, DB_PATH, DB_DSN, certificate paths or
+the /data volume.** No database conversion/reset is required.
+
+Route `gophish-production-7157.up.railway.app` to **3334**, not 3333. Leave the
+campaign domain and Railway `/health` check routed to **8080**. Architecture:
+Railway HTTPS → Nginx HTTP :3334 → GoPhish HTTP 127.0.0.1:3333. Railway supplies
+the publicly trusted TLS certificate; internal HTTP does not disable client TLS
+validation. Do not expose 3334 through a raw TCP proxy or another untrusted HTTP
+route. Nginx declares the upstream scheme HTTPS because this is exclusively an
+HTTPS-edge listener. Forwarded protocol/host/IP headers are overwritten; the
+upstream IP is the immediate Railway peer, not an authenticated end-user IP.
+
+This **publicly exposes the panel and API**. Authentication/API keys remain
+required; there is **no IP restriction** unless separately configured. Restrict
+access with your organization's controls where appropriate. Both CSRF and session
+cookies stay Secure/HttpOnly independently of the internal listener TLS setting.
+Gorilla CSRF v1.6.2 compares `Referer.Host` to trusted origins: use comma-separated
+`host[:port]` values **without `https://`, paths or wildcards**. The API retains its
+existing API-key authentication and existing CSRF exception, not a new bypass.
+
+Nginx request/error logs and GoPhish admin access logs are disabled in proxy mode
+to avoid logging query-string API keys, headers, cookies or request bodies.
+Operational application logs and the campaign listener's original logging remain;
+restrict their access (the existing bootstrap logs contain the initial password).
+Prefer `Authorization: Bearer ...` rather than query-string keys in clients.
+
+A Python supervisor is PID 1 after privilege dropping. It validates Nginx before
+starting GoPhish, stops both process groups if either process exits, and returns
+nonzero so Railway can restart the service. SIGTERM/SIGINT request Nginx graceful
+QUIT and GoPhish TERM; remaining groups are killed after 25 seconds. Nginx PID and
+temporary files live in a private ephemeral /tmp directory; the generated private
+GoPhish config is removed on supervised shutdown. Use a stop allowance >=30s.
+
+Existing `--mode admin`, `--disable-mailer` and other application arguments are
+forwarded unchanged. `--mode phish` (both flag forms), `--help`/`-h` and `--version`
+run GoPhish directly without Nginx. `--config` overrides are rejected in proxy
+mode so they cannot bypass its security settings; non-proxy behavior is unchanged.
+
+**Deployment and rollback, without losing data:**
+
+1. Back up the existing database consistently, record current variables/network
+   targets and retain the current release. Use one replica, no overlapping database
+   writers. Validate the new image first with an isolated test database/volume.
+2. After authorized release, set the variables above and route only the admin
+   domain to 3334. Keep campaign routing, DB variables and volumes unchanged.
+3. Keep the existing TCP Proxy configuration until validation, but understand it
+   **cannot stay functional** once 3333 changes from public HTTPS to loopback HTTP.
+   This architecture has no simultaneous legacy TLS listener. Plan a maintenance
+   window; retaining that proxy configuration facilitates rollback, not live access.
+4. Check `/login`, `/settings`, valid login, invalid CSRF rejection, Secure cookies,
+   API rejection without a key and a read-only API request with the existing key.
+   Check campaign `/health` and existing landing pages without triggering sends.
+   Remove the old TCP Proxy only after successful validation.
+5. For rollback, stop the new release and restore the previous image/variables
+   (`ADMIN_PROXY_ENABLED=false`, previous public admin bind, `ADMIN_USE_TLS=true`,
+   `ALLOW_PUBLIC_ADMIN=true`, previous trusted hosts). Restore its TCP Proxy target
+   3333 and administrative domain routing as appropriate. Reuse the **same database,
+   /data volume and certificates**; never reinitialize/delete storage. Expect a new
+   login after restart. This change introduces no schema migration.
+
+The PHP integration should use:
+
+```apache
+SetEnv GOPHISH_API_URL "https://gophish-production-7157.up.railway.app"
+```
+
+Keep its API key, remove only the obsolete self-signed `GOPHISH_CA_FILE` override,
+retain normal certificate/hostname validation, and restart Apache.
+
+Run isolated configuration and supervisor tests with:
+
+```sh
+bash docker/run_test.sh
+python3 -B docker/supervise_test.py
+CGO_ENABLED=1 go test ./controllers -run 'TestAdminProxySecurity|TestPublicHealth|TestPublicDoesNotExposeAdmin' -count=1
+```
+
+These do not prove real Nginx/container/network behavior; see
+[the verification checklist](doc/railway.md#administrative-https-proxy-follow-up).
 
 - **Preferred restricted access:** establish an authenticated tunnel into the
   container's loopback listener using your organization's VPN/tunneling solution.
@@ -144,7 +240,7 @@ do not assume `railway connect` forwards this application.
   `ADMIN_LISTEN_URL=[::]:3333` and `ALLOW_PUBLIC_ADMIN=true`; provide a VPN gateway
   to that network. The private network is not directly accessible from a laptop.
   This repository does not install or configure a tunnel/VPN.
-- **Simplest browser-access option in the same deployment:** deliberately enable
+- **Legacy TLS/TCP alternative (not simultaneous with proxy mode):** deliberately enable
   a Railway **TCP Proxy** targeting port 3333, set
   `ADMIN_LISTEN_URL=0.0.0.0:3333`, `ALLOW_PUBLIC_ADMIN=true`, and retain
   `ADMIN_USE_TLS=true`. Visit `https://<tcp-proxy-host>:<assigned-external-port>`.

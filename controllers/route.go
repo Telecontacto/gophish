@@ -159,7 +159,7 @@ func (as *AdminServer) registerRoutes() {
 	}
 	csrfHandler := csrf.Protect(csrfKey,
 		csrf.FieldName("csrf_token"),
-		csrf.Secure(as.config.UseTLS),
+		csrf.Secure(as.config.UseTLS || as.config.SecureCookies),
 		csrf.TrustedOrigins(as.config.TrustedOrigins))
 	adminHandler := csrfHandler(router)
 	adminHandler = mid.Use(adminHandler.ServeHTTP, mid.CSRFExceptions, mid.GetContext, mid.ApplySecurityHeaders)
@@ -173,7 +173,9 @@ func (as *AdminServer) registerRoutes() {
 	adminHandler = handlers.ProxyHeaders(adminHandler)
 
 	// Setup logging
-	adminHandler = handlers.CombinedLoggingHandler(log.Writer(), adminHandler)
+	if !as.config.DisableAccessLog {
+		adminHandler = handlers.CombinedLoggingHandler(log.Writer(), adminHandler)
+	}
 	as.server.Handler = adminHandler
 }
 

@@ -9,7 +9,7 @@ COPY . .
 RUN CGO_ENABLED=1 GOOS=linux go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/gophish .
 
 FROM debian:bookworm-slim
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates jq gosu tzdata \
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates jq gosu tzdata nginx python3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app
@@ -28,6 +28,8 @@ COPY static/font/ ./static/font/
 COPY static/db/ ./static/db/
 COPY static/endpoint/ ./static/endpoint/
 COPY docker/run.sh /usr/local/bin/gophish-entrypoint
+COPY docker/supervise.py /opt/gophish/supervise.py
+COPY docker/nginx.conf /opt/gophish/nginx.conf
 RUN sed -i 's/\r$//' /usr/local/bin/gophish-entrypoint \
     && chmod 755 /usr/local/bin/gophish-entrypoint
 

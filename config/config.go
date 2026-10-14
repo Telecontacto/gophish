@@ -11,6 +11,8 @@ import (
 type AdminServer struct {
 	ListenURL            string   `json:"listen_url"`
 	UseTLS               bool     `json:"use_tls"`
+	SecureCookies        bool     `json:"secure_cookies"`
+	DisableAccessLog     bool     `json:"disable_access_log"`
 	CertPath             string   `json:"cert_path"`
 	KeyPath              string   `json:"key_path"`
 	CSRFKey              string   `json:"csrf_key"`

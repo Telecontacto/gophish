@@ -116,7 +116,7 @@ func main() {
 	}
 	adminConfig := conf.AdminConf
 	adminServer := controllers.NewAdminServer(adminConfig, adminOptions...)
-	middleware.Store.Options.Secure = adminConfig.UseTLS
+	middleware.Store.Options.Secure = adminConfig.UseTLS || adminConfig.SecureCookies
 
 	phishConfig := conf.PhishConf
 	phishServer := controllers.NewPhishingServer(phishConfig, controllers.WithContactAddress(conf.ContactAddress))

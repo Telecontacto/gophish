@@ -1,5 +1,146 @@
 # Railway deployment analysis
 
+## Administrative HTTPS proxy follow-up
+
+This section supersedes earlier statements below that no admin HTTP domain or
+supervisor is implemented. The default remains loopback admin TLS; opt-in proxy
+mode adds Railway HTTPS → Nginx HTTP :3334 → GoPhish HTTP 127.0.0.1:3333. Campaign
+HTTP on :8080 and its `/health` route are unchanged. This is one GoPhish process,
+not a service split. No schema, database configuration or migration was changed.
+
+### Configuration and security
+
+```text
+ADMIN_PROXY_ENABLED=true
+ADMIN_LISTEN_URL=127.0.0.1:3333
+ADMIN_USE_TLS=false
+ALLOW_PUBLIC_ADMIN=false
+ADMIN_TRUSTED_ORIGINS=gophish-production-7157.up.railway.app
+PORT=8080
+PHISH_LISTEN_URL=0.0.0.0:8080
+```
+
+Preserve **all existing** DB_NAME/DB_PATH/DB_DSN, optional MySQL CA configuration,
+certificate files and /data volume. Route the administrative domain to 3334, not
+3333; leave campaign domain and healthcheck routed to 8080. The additional
+`ADMIN_PROXY_ENABLED` opt-in is required; merely disabling TLS does not start Nginx.
+
+Inspected the locked Gorilla CSRF v1.6.2 implementation: unsafe HTTPS requests
+check Referer; trusted values are compared to `referer.Host`, not a full origin
+URL. Correct format is comma-separated **host[:port], no scheme/path/wildcard**.
+Gorilla handlers v1.4.2 `ProxyHeaders` sets request URL scheme from
+X-Forwarded-Proto before CSRF executes. Nginx preserves Host, sets forwarded Host,
+forces HTTPS and overwrites Forwarded/client IP headers. It reports the immediate
+peer's IP rather than trusting a client-supplied IP chain. Do not expose port 3334
+via raw TCP or untrusted HTTP routing; it is exclusively for the Railway HTTPS edge.
+
+New admin JSON fields `secure_cookies` and `disable_access_log` default false for
+native/backward compatibility. Proxy mode forces both true. Session and CSRF
+cookies use `use_tls || secure_cookies`: internal HTTP therefore does not weaken
+cookie transport security. CSRF/authentication/API-key checks are unchanged. The
+API keeps its existing CSRF exemption. No client TLS validation is disabled.
+HTTP admin outside localhost remains prohibited; proxy mode specifically requires
+127.0.0.1:3333 and ALLOW_PUBLIC_ADMIN=false. Config override flags are rejected in
+proxy mode so callers cannot bypass these constraints.
+
+The panel/API become **publicly reachable** with authentication, not IP-restricted.
+Any IP allowlist/VPN/edge restriction must be configured explicitly by the operator.
+Nginx access/error request logs and GoPhish admin combined access logs are disabled
+in proxy mode: Nginx errors and combined logs can contain query-string API keys.
+No proxy logs capture Authorization, cookies or bodies. Existing operational and
+campaign logs remain; the upstream bootstrap password logging remains a sensitive
+existing limitation. Clients should prefer Bearer API authentication.
+
+### Runtime and compatibility
+
+Runtime adds Debian nginx/python3 and `docker/supervise.py`. Root bootstrap and
+selective volume ownership remain; GoPhish, supervisor and Nginx execute as UID/GID
+10001. Nginx PID/body/proxy/other temporary directories live under a private /tmp
+prefix, not /var/run, /var/log or /data. Configuration remains private with umask
+077, never printed; supervisor deletes its generated JSON on shutdown.
+
+The supervisor validates Nginx before starting GoPhish, launches separate process
+groups, detects even unexpected clean exits, stops the sibling and exits nonzero.
+TERM/INT gracefully QUIT Nginx and TERM GoPhish; after 25 seconds remaining process
+groups receive KILL and direct children are reaped. Use a platform stop allowance
+of at least 30 seconds. Existing GoPhish mail/IMAP drain limitations remain.
+
+Arguments are passed as an argv list, not shell text. `--mode admin` and
+`--disable-mailer` remain supported. Campaign-only mode (`--mode phish` or
+`--mode=phish`) and help/version execute GoPhish directly without Nginx. Non-proxy
+startup is unchanged; proxy mode rejects `--config`/`--config=...` overrides.
+
+### Verification results and remaining integration checklist
+
+Executed locally on Windows with Git Bash/jq and a stub executable:
+`bash docker/run_test.sh` passed for SQLite/MySQL, private config generation,
+no DSN output, proxy cookie/origin settings, argument handoff, config override
+rejection and retained non-loopback HTTP security guards.
+
+`python3 -B docker/supervise_test.py` passed all six mocked unit tests: graceful
+signals, unexpected application exit, Nginx exit, forced shutdown timeout,
+configuration failure and partial startup failure. This does not test real Unix
+signals/process groups on Windows. Shell syntax and `git diff --check` passed.
+
+Go handler regression tests passed with Go 1.26.8, CGO/Zig and locked dependencies:
+`TestAdminProxySecurity`, `TestPublicHealth`, `TestPublicDoesNotExposeAdmin`.
+The proxy test uses a synthetic in-memory SQLite database, no network listeners,
+SMTP/IMAP or campaign workers. It verifies login and settings, Secure/HttpOnly
+CSRF/session cookies, invalid/missing Referer and CSRF rejection, authenticated
+read-only API and 401 without a key. Forwarded headers emulate the Nginx contract;
+this is **not** an end-to-end Nginx test.
+
+The complete `go test -mod=readonly ./...` was attempted: controllers,
+controllers/api and webhook tests abort because Windows forbids their loopback
+socket listeners. Other tested packages passed. The full suite is **not passing**
+in this environment; rerun it on a Linux runner with networking.
+
+The optimized Linux/amd64 Go binary build passed with CGO/Zig against glibc using
+`-mod=readonly -trimpath -ldflags="-s -w"`. This is a cross-compilation check,
+not a Docker image build or Linux runtime test.
+
+Docker build was attempted but Docker is not installed. Before production, run
+on a Linux Docker host with **only isolated test data and volumes**:
+
+1. Build `docker build -t gophish-railway-proxy-test .`; run the configuration and
+   Python supervisor tests. Validate `nginx -t` with the private prefix.
+2. Start with the variables above and a new test /data volume (never production
+   DB_DSN), publish campaign 8080 and proxy 3334 on **host loopback only**. Use a
+   local HTTPS reverse proxy with a trusted development certificate for 3334,
+   or an isolated Railway staging service with HTTPS. Do not use insecure TLS
+   client options; Secure cookies intentionally will not work over plain HTTP.
+3. Inspect `/proc/1/status` and Nginx/GoPhish processes: UID/GID must be 10001.
+   Confirm listeners :3334, 127.0.0.1:3333 and :8080; admin 3333 must not bind publicly.
+4. Verify real HTTPS login/settings, cookies, CSRF failures, API without key 401
+   and read-only API with a synthetic test key. Inspect logs using only synthetic
+   sensitive markers to prove headers, URI keys and bodies are not recorded.
+5. Check public `/health`; verify a harmless test landing page without sending
+   emails/launching campaigns. Stop/restart and replace the container with the
+   same test volume to check data persistence.
+6. Send TERM/INT to PID 1; check both processes drain/exit. Kill either child in a
+   test container and verify the sibling stops and the container fails for restart.
+   Test forced timeout and startup failure. Also test a pre-owned volume with
+   `--user 10001:10001` to verify no-root startup.
+
+Live Nginx/container startup, listeners, HTTPS-edge TLS, process failure/signals,
+non-root filesystem ownership and persisted data across replacement remain
+unverified here. No production service was contacted, deployed or modified.
+
+### Deployment/rollback and PHP
+
+Follow the [README deployment/rollback procedure](../README.md#administrative-https-domain-through-railway-opt-in):
+consistent backup, one replica, preserve DB variables and volumes, validate staging,
+then authorized deployment and admin domain switch to 3334. Keep the current TCP
+Proxy definition until verification, but it stops working during the switch:
+there is no simultaneous public TLS listener once 3333 becomes loopback HTTP.
+For rollback restore previous release/admin TLS variables and TCP Proxy routing
+on the **same storage**; do not delete/import/recreate the database or certificates.
+
+PHP: `GOPHISH_API_URL=https://gophish-production-7157.up.railway.app`; keep the API
+key and standard certificate/hostname checks, remove only the previous self-signed
+GOPHISH_CA_FILE override and restart Apache. Nothing is pushed/published/deployed
+by this implementation.
+
 ## Original architecture and structure
 
 - `gophish.go`: main entrypoint; reads `./VERSION` before parsing Kingpin CLI
